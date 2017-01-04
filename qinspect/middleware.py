@@ -1,20 +1,13 @@
 import logging
 import collections
-import re
 import time
 import traceback
 import math
-
+import re
 from django.conf import settings
 from django.db import connection
 from django.core.exceptions import MiddlewareNotUsed
-try:
-    from django.utils.deprecation import MiddlewareMixin
-except ImportError:
-    class MiddlewareMixin(object):
-        def __init__(self, get_response=None):
-            pass
-
+from django.utils import termcolors
 
 try:
     from django.db.backends.utils import CursorDebugWrapper
@@ -32,27 +25,45 @@ log = logging.getLogger(__name__)
 log.addHandler(NullHandler())
 
 cfg = dict(
-    enabled=(settings.DEBUG and
+    enabled=(
+        settings.DEBUG and
         getattr(settings, 'QUERY_INSPECT_ENABLED', False)),
     log_stats=getattr(settings, 'QUERY_INSPECT_LOG_STATS', True),
     header_stats=getattr(settings, 'QUERY_INSPECT_HEADER_STATS', True),
     log_queries=getattr(settings, 'QUERY_INSPECT_LOG_QUERIES', False),
     log_tbs=getattr(settings, 'QUERY_INSPECT_LOG_TRACEBACKS', False),
     roots=getattr(settings, 'QUERY_INSPECT_TRACEBACK_ROOTS', None),
-    stddev_limit=getattr(settings, 'QUERY_INSPECT_STANDARD_DEVIATION_LIMIT',
+    stddev_limit=getattr(
+        settings, 'QUERY_INSPECT_STANDARD_DEVIATION_LIMIT',
         None),
     absolute_limit=getattr(settings, 'QUERY_INSPECT_ABSOLUTE_LIMIT', None),
+    threshold=getattr(settings, 'QUERY_INSPECT_THRESHOLD', {
+        'MEDIUM': 3,
+        'HIGH': 20,
+    }),
+    ignore_patterns=getattr(settings, 'QUERY_INSPECT_IGNORE_PATTERNS', []),
 )
 
 __all__ = ['QueryInspectMiddleware']
 
 
-class QueryInspectMiddleware(MiddlewareMixin):
+class QueryInspectMiddleware(object):
 
     class QueryInfo(object):
         __slots__ = ('sql', 'time', 'tb')
 
-    sql_id_pattern = re.compile(r'=\s*\d+')
+    def __init__(self, *args, **kwargs):
+
+        if not cfg['enabled']:
+            raise MiddlewareNotUsed()
+
+        # colorizing methods
+        self.white = termcolors.make_style(fg='white')
+        self.red = termcolors.make_style(fg='red')
+        self.yellow = termcolors.make_style(fg='yellow')
+        self.green = termcolors.make_style(fg='green')
+
+        super(QueryInspectMiddleware, self).__init__(*args, **kwargs)
 
     @classmethod
     def patch_cursor(cls):
@@ -85,12 +96,11 @@ class QueryInspectMiddleware(MiddlewareMixin):
         CursorDebugWrapper.execute = tb_wrap(real_exec)
         CursorDebugWrapper.executemany = tb_wrap(real_exec_many)
 
-    @classmethod
-    def get_query_infos(cls, queries):
+    def get_query_infos(self, queries):
         retval = []
         for q in queries:
-            qi = cls.QueryInfo()
-            qi.sql = cls.sql_id_pattern.sub('= ?', q['sql'])
+            qi = self.QueryInfo()
+            qi.sql = q['sql']
             qi.time = float(q['time'])
             qi.tb = q.get('tb')
             retval.append(qi)
@@ -110,27 +120,49 @@ class QueryInspectMiddleware(MiddlewareMixin):
             buf[qi.sql].append(qi)
         return buf
 
-    @classmethod
-    def check_duplicates(cls, infos):
-        duplicates = [(qi, num) for qi, num in cls.count_duplicates(infos)
+    def ignore_request(self, path):
+        """Check to see if we should ignore the request."""
+        return any([
+            re.match(pattern, path)
+            for pattern in cfg['ignore_patterns']
+        ])
+
+    def colorize(self, output, count):
+        if count > cfg['threshold']['HIGH']:
+            output = self.red(output)
+        elif count > cfg['threshold']['MEDIUM']:
+            output = self.yellow(output)
+        else:
+            output = self.green(output)
+        return output
+
+    def check_duplicates(self, infos):
+        duplicates = [
+            (qi, num) for qi, num in self.count_duplicates(infos)
             if num > 1]
         duplicates.reverse()
         n = 0
         if len(duplicates) > 0:
             n = (sum(num for qi, num in duplicates) - len(duplicates))
 
-        dup_groups = cls.group_queries(infos)
+        dup_groups = self.group_queries(infos)
 
         if cfg['log_queries']:
             for sql, num in duplicates:
-                log.warning('[SQL] repeated query (%dx): %s' % (num, sql))
+                log.info(
+                    self.colorize(
+                        '[SQL] repeated query (%dx): %s\n' % (num, sql),
+                        num
+                    )
+                )
                 if cfg['log_tbs'] and dup_groups[sql]:
-                    log.warning('Traceback:\n' +
+                    log.info(
+                        'Traceback:\n' +
                         ''.join(traceback.format_list(dup_groups[sql][0].tb)))
 
         return n
 
-    def check_stddev_limit(cls, infos):
+    def check_stddev_limit(self, infos):
         total = sum(qi.time for qi in infos)
         n = len(infos)
 
@@ -148,15 +180,15 @@ class QueryInspectMiddleware(MiddlewareMixin):
 
         for qi in infos:
             if qi.time > query_limit:
-                log.warning('[SQL] query execution of %d ms over limit of '
+                log.info(
+                    '[SQL] query execution of %d ms over limit of '
                     '%d ms (%d dev above mean): %s' % (
                         qi.time * 1000,
                         query_limit * 1000,
                         cfg['stddev_limit'],
                         qi.sql))
 
-    @classmethod
-    def check_absolute_limit(cls, infos):
+    def check_absolute_limit(self, infos):
         n = len(infos)
         if cfg['absolute_limit'] is None or n == 0:
             return
@@ -165,24 +197,25 @@ class QueryInspectMiddleware(MiddlewareMixin):
 
         for qi in infos:
             if qi.time > query_limit:
-                log.warning('[SQL] query execution of %d ms over absolute '
+                log.info(
+                    '[SQL] query execution of %d ms over absolute '
                     'limit of %d ms: %s' % (
                         qi.time * 1000,
                         query_limit * 1000,
                         qi.sql))
 
-    @classmethod
     def output_stats(self, infos, num_duplicates, request_time, response):
         sql_time = sum(qi.time for qi in infos)
         n = len(infos)
 
         if cfg['log_stats']:
-            log.info('[SQL] %d queries (%d duplicates), %d ms SQL time, '
+            log.info(self.yellow(
+                '[SQL] %d queries (%d duplicates), %d ms SQL time, '
                 '%d ms total request time' % (
                     n,
                     num_duplicates,
                     sql_time * 1000,
-                    request_time * 1000))
+                    request_time * 1000)))
 
         if cfg['header_stats']:
             response['X-QueryInspect-Num-SQL-Queries'] = str(n)
@@ -193,28 +226,25 @@ class QueryInspectMiddleware(MiddlewareMixin):
             response['X-QueryInspect-Duplicate-SQL-Queries'] = str(
                 num_duplicates)
 
-    def __init__(self, get_response=None):
-        if not cfg['enabled']:
-            raise MiddlewareNotUsed()
-        super(QueryInspectMiddleware, self).__init__(get_response)
-
     def process_request(self, request):
-        self.request_start = time.time()
-        self.conn_queries_len = len(connection.queries)
+        if not self.ignore_request(request.path):
+            self.request_start = time.time()
+            self.conn_queries_len = len(connection.queries)
 
     def process_response(self, request, response):
-        if not hasattr(self, "request_start"):
-            return response
-            
-        request_time = time.time() - self.request_start
+        if (
+            hasattr(self, "request_start") and
+            not self.ignore_request(request.path)
+        ):
+            request_time = time.time() - self.request_start
 
-        infos = self.get_query_infos(
-            connection.queries[self.conn_queries_len:])
+            infos = self.get_query_infos(
+                connection.queries[self.conn_queries_len:])
 
-        num_duplicates = self.check_duplicates(infos)
-        self.check_stddev_limit(infos)
-        self.check_absolute_limit(infos)
-        self.output_stats(infos, num_duplicates, request_time, response)
+            num_duplicates = self.check_duplicates(infos)
+            self.check_stddev_limit(infos)
+            self.check_absolute_limit(infos)
+            self.output_stats(infos, num_duplicates, request_time, response)
 
         return response
 
